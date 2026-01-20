@@ -8,7 +8,8 @@ import sys
 import subprocess
 import os
 import shutil
-from datetime import datetime
+import time
+from datetime import datetime, timezone, timedelta
 from alibabacloud_alidns20150109.client import Client as Alidns20150109Client
 from alibabacloud_tea_openapi import models as open_api_models
 from alibabacloud_alidns20150109 import models as alidns_models
@@ -24,10 +25,10 @@ RECORD_TYPE = 'A'                 # 记录类型
 TTL = 600                         # TTL 值（秒）
 # ==========================================================
 
-
 def get_public_ip():
     """
     获取 AWS EC2 当前公网 IPv4（使用 IMDSv2）
+    最多重试3次，每次失败后等待5秒
 
     Returns:
         str: 公网 IP 地址，失败返回 None
@@ -37,48 +38,78 @@ def get_public_ip():
         print("错误: 未找到 curl 命令，请先安装 curl", file=sys.stderr)
         return None
 
-    try:
-        # 步骤1: 获取 IMDSv2 token
-        token = subprocess.check_output([
-            'curl', '-s', '-X', 'PUT',
-            'http://169.254.169.254/latest/api/token',
-            '-H', 'X-aws-ec2-metadata-token-ttl-seconds: 21600'
-        ], timeout=5).decode().strip()
+    max_retries = 3
+    retry_delay = 5  # 秒
 
-        if not token:
-            print("错误: 无法获取 IMDS token", file=sys.stderr)
+    for attempt in range(1, max_retries + 1):
+        try:
+            if attempt > 1:
+                print(f"第 {attempt} 次尝试获取公网 IP...")
+            # 步骤1: 获取 IMDSv2 token
+            token = subprocess.check_output([
+                'curl', '-s', '-X', 'PUT',
+                'http://169.254.169.254/latest/api/token',
+                '-H', 'X-aws-ec2-metadata-token-ttl-seconds: 21600'
+            ], timeout=5).decode().strip()
+
+            if not token:
+                print("错误: 无法获取 IMDS token", file=sys.stderr)
+                if attempt < max_retries:
+                    print(f"等待 {retry_delay} 秒后重试...", file=sys.stderr)
+                    time.sleep(retry_delay)
+                    continue
+                return None
+
+            # 步骤2: 使用 token 获取公网 IP
+            ip = subprocess.check_output([
+                'curl', '-s',
+                '-H', f'X-aws-ec2-metadata-token: {token}',
+                'http://169.254.169.254/latest/meta-data/public-ipv4'
+            ], timeout=5).decode().strip()
+
+            # 简单验证 IP 格式
+            if ip and ip.count('.') == 3:
+                if attempt > 1:
+                    print(f"成功获取公网 IP（第 {attempt} 次尝试）")
+                return ip
+            else:
+                print(f"错误: 获取到的 IP 格式不正确: {ip}", file=sys.stderr)
+                if attempt < max_retries:
+                    print(f"等待 {retry_delay} 秒后重试...", file=sys.stderr)
+                    time.sleep(retry_delay)
+                    continue
+                return None
+
+        except subprocess.TimeoutExpired:
+            print(f"错误: 获取公网 IP 超时（可能不在 AWS EC2 环境中）", file=sys.stderr)
+            if attempt < max_retries:
+                print(f"等待 {retry_delay} 秒后重试...", file=sys.stderr)
+                time.sleep(retry_delay)
+                continue
+            return None
+        except subprocess.CalledProcessError as e:
+            print(f"错误: curl 命令执行失败: {e}", file=sys.stderr)
+            if attempt < max_retries:
+                print(f"等待 {retry_delay} 秒后重试...", file=sys.stderr)
+                time.sleep(retry_delay)
+                continue
+            return None
+        except Exception as e:
+            print(f"错误: 获取公网 IP 失败: {e}", file=sys.stderr)
+            if attempt < max_retries:
+                print(f"等待 {retry_delay} 秒后重试...", file=sys.stderr)
+                time.sleep(retry_delay)
+                continue
             return None
 
-        # 步骤2: 使用 token 获取公网 IP
-        ip = subprocess.check_output([
-            'curl', '-s',
-            '-H', f'X-aws-ec2-metadata-token: {token}',
-            'http://169.254.169.254/latest/meta-data/public-ipv4'
-        ], timeout=5).decode().strip()
-
-        # 简单验证 IP 格式
-        if ip and ip.count('.') == 3:
-            return ip
-        else:
-            print(f"错误: 获取到的 IP 格式不正确: {ip}", file=sys.stderr)
-            return None
-
-    except subprocess.TimeoutExpired:
-        print("错误: 获取公网 IP 超时（可能不在 AWS EC2 环境中）", file=sys.stderr)
-        return None
-    except subprocess.CalledProcessError as e:
-        print(f"错误: curl 命令执行失败: {e}", file=sys.stderr)
-        return None
-    except Exception as e:
-        print(f"错误: 获取公网 IP 失败: {e}", file=sys.stderr)
-        return None
+    return None
 
 
 def main():
     """主函数：执行 DDNS 更新流程"""
 
     # 打印开始执行时间
-    start_time = datetime.now()
+    start_time = datetime.now(timezone(timedelta(hours=8)))
     print(">" * 5)
     print(f"开始执行时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
